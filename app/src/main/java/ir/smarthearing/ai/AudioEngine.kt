@@ -28,6 +28,54 @@ object AudioEngine {
     @Volatile var treble = 0.5f           // زیر (۰.۵ = خنثی)
     @Volatile var volume = 0.4f           // بلندی خروجی
 
+    // ---- حالت خودکار ----
+    const val P_NOISE = 0
+    const val P_SPEECH = 1
+    const val P_WIND = 2
+    const val P_BASS = 3
+    const val P_TREBLE = 4
+    const val P_VOLUME = 5
+    const val PARAM_COUNT = 6
+
+    /** اگر روشن باشد، برنامه پارامترهای «قفل‌نشده» را خودش تنظیم می‌کند. */
+    @Volatile var autoMode = true
+    /** پارامتری که کاربر دستی تغییر داده قفل می‌شود و خودکار دست نمی‌زند. */
+    private val locked = BooleanArray(PARAM_COUNT)
+    @Volatile var envText = "—"
+        private set
+
+    fun getParam(i: Int): Float = when (i) {
+        P_NOISE -> noiseReduction
+        P_SPEECH -> speechBoost
+        P_WIND -> windCut
+        P_BASS -> bass
+        P_TREBLE -> treble
+        else -> volume
+    }
+
+    fun setParam(i: Int, v: Float) {
+        val c = v.coerceIn(0f, 1f)
+        when (i) {
+            P_NOISE -> noiseReduction = c
+            P_SPEECH -> speechBoost = c
+            P_WIND -> windCut = c
+            P_BASS -> bass = c
+            P_TREBLE -> treble = c
+            else -> volume = c
+        }
+    }
+
+    fun setLocked(i: Int, l: Boolean) { locked[i] = l }
+    fun isLocked(i: Int): Boolean = locked[i]
+    fun unlockAll() { for (i in 0 until PARAM_COUNT) locked[i] = false }
+
+    /** حرکت نرم پارامتر به‌سوی مقدار هدف (فقط اگر کاربر قفلش نکرده باشد) */
+    private fun autoStep(i: Int, target: Float) {
+        if (locked[i]) return
+        val cur = getParam(i)
+        setParam(i, cur + 0.004f * (target.coerceIn(0f, 1f) - cur))
+    }
+
     @Volatile var running = false
         private set
     @Volatile var inputLevel = 0f
@@ -149,6 +197,17 @@ object AudioEngine {
         var gateGain = 1f
         var vadGain = 1f
 
+        // تحلیل محیط برای حالت خودکار
+        val lpWind = OnePole(200f)
+        val lpHf = OnePole(3000f)
+        var noiseTrackDb = -70f     // فقط برای حالت بدون AI
+        var noiseDbS = -70f         // سطح نویز محیط (dBFS)
+        var speechDbS = -40f        // سطح گفتار (dBFS)
+        var windS = 0.2f            // سهم انرژی فرکانس‌های خیلی پایین در نویز
+        var hfS = 0.05f             // سهم انرژی فرکانس‌های بالا در گفتار
+        var framesSinceSpeech = 100000
+        var frameCount = 0
+
         val inBuf = ShortArray(FRAME)
         val outBuf = ShortArray(FRAME)
         val dry = FloatArray(FRAME)
@@ -181,9 +240,19 @@ object AudioEngine {
                 var outPeak = 0f
 
                 // ۱) بالاگذر (حذف باد) — مقیاس ۱۶ بیتی برای RNNoise
+                var eRaw = 0f
+                var eLow = 0f
+                var eHf = 0f
                 for (i in 0 until FRAME) {
                     var x = inBuf[i].toFloat()
                     inPeak = max(inPeak, abs(x) / 32768f)
+                    // آمار صدای خام برای تحلیل محیط
+                    val xn = x / 32768f
+                    eRaw += xn * xn
+                    val lw = lpWind.lp(xn)
+                    eLow += lw * lw
+                    val hf = xn - lpHf.lp(xn)
+                    eHf += hf * hf
                     for (s in 0..1) {
                         val y = hpA * (hpState[s] + x - hpPrevIn[s])
                         hpPrevIn[s] = x
@@ -202,6 +271,57 @@ object AudioEngine {
                 }
                 // در سکوت/نویز، کمی بیشتر کم می‌کنیم
                 val vadTarget = if (aiActive) 1f - nr * 0.6f * (1f - vad) else 1f
+
+                // ---- تحلیل محیط و تنظیم خودکار ----
+                val rmsDb = (20.0 * Math.log10(Math.sqrt((eRaw / FRAME).toDouble()) + 1e-9)).toFloat()
+                val lowRatio = eLow / (eRaw + 1e-12f)
+                val hfRatio = eHf / (eRaw + 1e-12f)
+                val speechProb: Float = if (aiActive) vad else {
+                    noiseTrackDb = if (rmsDb < noiseTrackDb) noiseTrackDb + 0.1f * (rmsDb - noiseTrackDb)
+                                   else noiseTrackDb + 0.01f
+                    if (rmsDb > noiseTrackDb + 8f) 1f else 0f
+                }
+                if (rmsDb > -85f) {
+                    if (speechProb < 0.3f) {
+                        noiseDbS += 0.02f * (rmsDb - noiseDbS)
+                        windS += 0.02f * (lowRatio - windS)
+                    } else if (speechProb > 0.7f) {
+                        speechDbS += 0.05f * (rmsDb - speechDbS)
+                        hfS += 0.03f * (hfRatio - hfS)
+                        framesSinceSpeech = 0
+                    }
+                }
+                if (framesSinceSpeech < 100000) framesSinceSpeech++
+
+                val noiseF = ((noiseDbS + 65f) / 30f).coerceIn(0f, 1f)
+                val windF = ((windS - 0.6f) / 0.35f).coerceIn(0f, 1f) *
+                    ((noiseDbS + 70f) / 15f).coerceIn(0f, 1f)
+                val dull = ((0.06f - hfS) / 0.06f).coerceIn(0f, 1f)
+
+                if (autoMode) {
+                    autoStep(P_NOISE, 0.2f + 0.7f * noiseF)
+                    autoStep(P_WIND, 0.15f + 0.8f * windF)
+                    autoStep(P_SPEECH, 0.2f + 0.6f * ((-25f - speechDbS) / 25f).coerceIn(0f, 1f))
+                    autoStep(P_BASS, (0.5f - 0.2f * noiseF - 0.15f * windF).coerceIn(0.2f, 0.5f))
+                    autoStep(P_TREBLE, 0.55f + 0.2f * dull * (1f - 0.5f * noiseF))
+                    // بلندی: فقط وقتی اخیراً گفتار بوده، تا گفتار به سطح راحت (حدود -۲۴ dBFS) برسد
+                    if (framesSinceSpeech < 300) {
+                        val needDb = -24f - speechDbS
+                        val g = Math.pow(10.0, (needDb / 20f).toDouble()).toFloat()
+                        autoStep(P_VOLUME, ((g - 0.2f) / 4.8f).coerceIn(0.15f, 0.75f))
+                    }
+                }
+
+                frameCount++
+                if (frameCount % 50 == 0) {
+                    val kind = when {
+                        windF > 0.5f -> "باد/لرزش"
+                        noiseDbS > -40f -> "شلوغ"
+                        noiseDbS > -55f -> "متوسط"
+                        else -> "ساکت"
+                    }
+                    envText = "محیط: $kind  •  نویز ${noiseDbS.toInt()} dB  •  گفتار ${speechDbS.toInt()} dB"
+                }
 
                 for (i in 0 until FRAME) {
                     // ترکیب سیگنال خام و پاک‌شده بر اساس «کنترل نویز»

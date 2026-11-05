@@ -17,6 +17,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 
@@ -26,8 +27,23 @@ class MainActivity : Activity() {
     private lateinit var toggle: Button
     private lateinit var status: TextView
     private lateinit var latency: TextView
+    private lateinit var env: TextView
     private lateinit var inMeter: ProgressBar
     private lateinit var outMeter: ProgressBar
+    private lateinit var autoSwitch: Switch
+
+    private val seeks = arrayOfNulls<SeekBar>(AudioEngine.PARAM_COUNT)
+    private val labels = arrayOfNulls<TextView>(AudioEngine.PARAM_COUNT)
+    private val touching = BooleanArray(AudioEngine.PARAM_COUNT)
+
+    private val titles = arrayOf(
+        "کنترل نویز (حذف خش‌خش)",
+        "تقویت گفتار",
+        "حذف صدای باد",
+        "بم",
+        "زیر",
+        "کنترل صدا (بلندی خروجی)"
+    )
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -78,12 +94,40 @@ class MainActivity : Activity() {
         outMeter = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
         root.addView(outMeter)
 
-        addSlider(root, "کنترل نویز (حذف خش‌خش)", AudioEngine.noiseReduction) { AudioEngine.noiseReduction = it }
-        addSlider(root, "تقویت گفتار", AudioEngine.speechBoost) { AudioEngine.speechBoost = it }
-        addSlider(root, "حذف صدای باد", AudioEngine.windCut) { AudioEngine.windCut = it }
-        addSlider(root, "بم", AudioEngine.bass) { AudioEngine.bass = it }
-        addSlider(root, "زیر", AudioEngine.treble) { AudioEngine.treble = it }
-        addSlider(root, "کنترل صدا (بلندی خروجی)", AudioEngine.volume) { AudioEngine.volume = it }
+        // ---- حالت خودکار ----
+        autoSwitch = Switch(this).apply {
+            text = "تنظیم خودکار با هوش مصنوعی"
+            textSize = 16f
+            isChecked = AudioEngine.autoMode
+            setPadding(0, dp(20), 0, dp(4))
+            setOnCheckedChangeListener { _, checked -> AudioEngine.autoMode = checked }
+        }
+        root.addView(autoSwitch)
+
+        env = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.parseColor("#0F766E"))
+        }
+        root.addView(env)
+
+        root.addView(TextView(this).apply {
+            text = "در حالت خودکار، برنامه با تحلیل صدای محیط، نوارها را خودش تنظیم می‌کند. " +
+                "هر نواری را که خودتان تکان دهید قفل می‌شود و دیگر خودکار تغییرش نمی‌دهد؛ " +
+                "برای برگرداندن آن به حالت خودکار روی نام نوار بزنید."
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setPadding(0, dp(4), 0, dp(4))
+        })
+
+        root.addView(Button(this).apply {
+            text = "بازگشت همه به حالت خودکار"
+            setOnClickListener {
+                AudioEngine.unlockAll()
+                autoSwitch.isChecked = true
+            }
+        })
+
+        for (i in 0 until AudioEngine.PARAM_COUNT) addSlider(root, i)
 
         root.addView(TextView(this).apply {
             text = "این برنامه جایگزین تنظیم تخصصی سمعک نیست و فقط برای آزمایش است. " +
@@ -102,19 +146,30 @@ class MainActivity : Activity() {
         setPadding(0, dp(14), 0, dp(2))
     }
 
-    private fun addSlider(parent: LinearLayout, title: String, initial: Float, onChange: (Float) -> Unit) {
-        parent.addView(label(title))
-        parent.addView(SeekBar(this).apply {
+    private fun addSlider(parent: LinearLayout, idx: Int) {
+        val lbl = label(titles[idx])
+        lbl.setOnClickListener {
+            // برگرداندن این نوار به حالت خودکار
+            AudioEngine.setLocked(idx, false)
+        }
+        labels[idx] = lbl
+        parent.addView(lbl)
+
+        val sb = SeekBar(this).apply {
             max = 100
-            progress = (initial * 100).toInt()
+            progress = (AudioEngine.getParam(idx) * 100).toInt()
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                    onChange(p / 100f)
+                    if (!fromUser) return
+                    AudioEngine.setParam(idx, p / 100f)
+                    if (AudioEngine.autoMode) AudioEngine.setLocked(idx, true)
                 }
-                override fun onStartTrackingTouch(s: SeekBar?) {}
-                override fun onStopTrackingTouch(s: SeekBar?) {}
+                override fun onStartTrackingTouch(s: SeekBar?) { touching[idx] = true }
+                override fun onStopTrackingTouch(s: SeekBar?) { touching[idx] = false }
             })
-        })
+        }
+        seeks[idx] = sb
+        parent.addView(sb)
     }
 
     private fun onToggle() {
@@ -159,6 +214,23 @@ class MainActivity : Activity() {
         latency.text = if (on) "تأخیر تقریبی: ${AudioEngine.latencyMs} میلی‌ثانیه" else "تأخیر تقریبی: —"
         inMeter.progress = (AudioEngine.inputLevel * 100).toInt()
         outMeter.progress = (AudioEngine.outputLevel * 100).toInt()
+
+        if (autoSwitch.isChecked != AudioEngine.autoMode) autoSwitch.isChecked = AudioEngine.autoMode
+        env.text = if (AudioEngine.autoMode && on) AudioEngine.envText else ""
+
+        val auto = AudioEngine.autoMode
+        for (i in 0 until AudioEngine.PARAM_COUNT) {
+            val locked = AudioEngine.isLocked(i)
+            // در حالت خودکار، نوارهای قفل‌نشده همراه مقدار انتخابی برنامه حرکت می‌کنند
+            if (auto && !locked && !touching[i]) {
+                seeks[i]?.progress = (AudioEngine.getParam(i) * 100).toInt()
+            }
+            labels[i]?.text = titles[i] + when {
+                !auto -> ""
+                locked -> "   🔒 دستی"
+                else -> "   ✨ خودکار"
+            }
+        }
     }
 
     override fun onResume() { super.onResume(); ui.post(ticker) }
