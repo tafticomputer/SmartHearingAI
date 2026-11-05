@@ -1,0 +1,257 @@
+package ir.smarthearing.ai
+
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.tanh
+
+/**
+ * موتور صدا: میکروفون -> بالاگذر (باد) -> RNNoise (هوش مصنوعی) -> تقویت گفتار/EQ -> خروجی.
+ * پارامترها همگی بین ۰ تا ۱ هستند و هر لحظه قابل تغییرند.
+ */
+object AudioEngine {
+
+    private const val SAMPLE_RATE = 48000
+    private const val FRAME = RNNoise.FRAME // ۴۸۰ نمونه = ۱۰ میلی‌ثانیه
+
+    @Volatile var noiseReduction = 0.7f   // میزان حذف نویز
+    @Volatile var speechBoost = 0.4f      // تقویت گفتار
+    @Volatile var windCut = 0.3f          // حذف صدای باد
+    @Volatile var bass = 0.5f             // بم (۰.۵ = خنثی)
+    @Volatile var treble = 0.5f           // زیر (۰.۵ = خنثی)
+    @Volatile var volume = 0.4f           // بلندی خروجی
+
+    @Volatile var running = false
+        private set
+    @Volatile var inputLevel = 0f
+        private set
+    @Volatile var outputLevel = 0f
+        private set
+    @Volatile var latencyMs = 0
+        private set
+    @Volatile var aiActive = false
+        private set
+    @Volatile var lastError: String? = null
+        private set
+
+    private var thread: Thread? = null
+
+    fun start() {
+        if (running) return
+        lastError = null
+        running = true
+        thread = Thread({ loop() }, "AudioEngine").also {
+            it.priority = Thread.MAX_PRIORITY
+            it.start()
+        }
+    }
+
+    fun stop() {
+        running = false
+        try { thread?.join(1500) } catch (_: InterruptedException) { }
+        thread = null
+        inputLevel = 0f
+        outputLevel = 0f
+    }
+
+    private class OnePole(private val cutoffHz: Float) {
+        private val a = 1f - Math.exp(-2.0 * Math.PI * cutoffHz / SAMPLE_RATE).toFloat()
+        private var y = 0f
+        fun lp(x: Float): Float { y += a * (x - y); return y }
+    }
+
+    private fun loop() {
+        val inMin = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        val outMin = AudioTrack.getMinBufferSize(
+            SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (inMin <= 0 || outMin <= 0) {
+            lastError = "فرمت صدا روی این گوشی پشتیبانی نمی‌شود"
+            running = false
+            return
+        }
+
+        val recorder: AudioRecord
+        val track: AudioTrack
+        try {
+            recorder = AudioRecord(
+                MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                max(inMin, FRAME * 2 * 2)
+            )
+            track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(max(outMin, FRAME * 2 * 2))
+                .build()
+        } catch (e: Exception) {
+            lastError = "خطا در راه‌اندازی صدا: ${e.message}"
+            running = false
+            return
+        }
+
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            lastError = "میکروفون در دسترس نیست (مجوز را بررسی کنید)"
+            running = false
+            recorder.release(); track.release()
+            return
+        }
+
+        var ns: NoiseSuppressor? = null
+        var agc: AutomaticGainControl? = null
+        try {
+            // اگر RNNoise در دسترس نیست، از نویزگیر سخت‌افزاری گوشی استفاده می‌کنیم
+            if (!RNNoise.available && NoiseSuppressor.isAvailable())
+                ns = NoiseSuppressor.create(recorder.audioSessionId)?.also { it.enabled = true }
+            if (AutomaticGainControl.isAvailable())
+                agc = AutomaticGainControl.create(recorder.audioSessionId)?.also { it.enabled = false }
+        } catch (_: Exception) { }
+
+        // مدل هوش مصنوعی
+        val handle: Long = if (RNNoise.available) {
+            try { RNNoise.create() } catch (_: Throwable) { 0L }
+        } else 0L
+        aiActive = handle != 0L
+
+        latencyMs = ((recorder.bufferSizeInFrames + track.bufferSizeInFrames) * 1000L / SAMPLE_RATE).toInt() +
+            (if (aiActive) 10 else 0)
+
+        val lpBass = OnePole(300f)
+        val lpLow = OnePole(1000f)
+        val lpHigh = OnePole(3500f)
+        val lpTreble = OnePole(3000f)
+        val hpState = FloatArray(2)
+        val hpPrevIn = FloatArray(2)
+        var envelope = 0f
+        var noiseFloor = 0.01f
+        var gateGain = 1f
+        var vadGain = 1f
+
+        val inBuf = ShortArray(FRAME)
+        val outBuf = ShortArray(FRAME)
+        val dry = FloatArray(FRAME)
+        val wet = FloatArray(FRAME)
+
+        try {
+            recorder.startRecording()
+            track.play()
+
+            while (running) {
+                // خواندن یک فریم کامل (۴۸۰ نمونه)
+                var got = 0
+                while (got < FRAME && running) {
+                    val n = recorder.read(inBuf, got, FRAME - got)
+                    if (n < 0) throw IllegalStateException("خطای خواندن میکروفون ($n)")
+                    got += n
+                }
+                if (!running) break
+
+                val nr = noiseReduction
+                val sb = speechBoost
+                val wc = windCut
+                val bassG = (bass - 0.5f) * 4f              // -2 .. +2
+                val trebG = (treble - 0.5f) * 4f
+                val outGain = 0.2f + volume * 4.8f          // 0.2 .. 5
+                val hpCut = 40f + wc * 260f
+                val hpA = Math.exp(-2.0 * Math.PI * hpCut / SAMPLE_RATE).toFloat()
+
+                var inPeak = 0f
+                var outPeak = 0f
+
+                // ۱) بالاگذر (حذف باد) — مقیاس ۱۶ بیتی برای RNNoise
+                for (i in 0 until FRAME) {
+                    var x = inBuf[i].toFloat()
+                    inPeak = max(inPeak, abs(x) / 32768f)
+                    for (s in 0..1) {
+                        val y = hpA * (hpState[s] + x - hpPrevIn[s])
+                        hpPrevIn[s] = x
+                        hpState[s] = y
+                        x = y
+                    }
+                    dry[i] = x
+                }
+
+                // ۲) حذف نویز با هوش مصنوعی
+                var vad = 1f
+                if (aiActive) {
+                    vad = RNNoise.process(handle, dry, wet)
+                } else {
+                    System.arraycopy(dry, 0, wet, 0, FRAME)
+                }
+                // در سکوت/نویز، کمی بیشتر کم می‌کنیم
+                val vadTarget = if (aiActive) 1f - nr * 0.6f * (1f - vad) else 1f
+
+                for (i in 0 until FRAME) {
+                    // ترکیب سیگنال خام و پاک‌شده بر اساس «کنترل نویز»
+                    var x = (dry[i] * (1f - nr) + wet[i] * nr) / 32768f
+
+                    if (aiActive) {
+                        vadGain += 0.002f * (vadTarget - vadGain)
+                        x *= vadGain
+                    } else {
+                        // جایگزین ساده بدون AI: گیت نویز تطبیقی
+                        val ax = abs(x)
+                        envelope += (if (ax > envelope) 0.02f else 0.0015f) * (ax - envelope)
+                        noiseFloor = if (envelope < noiseFloor) {
+                            envelope + (noiseFloor - envelope) * 0.9995f
+                        } else noiseFloor * 1.00002f
+                        noiseFloor = noiseFloor.coerceIn(0.0005f, 0.2f)
+                        val threshold = noiseFloor * (1.5f + 2.5f * nr)
+                        val target = if (envelope > threshold) 1f else (1f - nr * 0.92f)
+                        gateGain += (if (target > gateGain) 0.01f else 0.0008f) * (target - gateGain)
+                        x *= gateGain
+                    }
+
+                    // ۳) تقویت باند گفتار (۱ تا ۳.۵ کیلوهرتز)
+                    x += (lpHigh.lp(x) - lpLow.lp(x)) * (sb * 2.5f)
+
+                    // ۴) بم و زیر
+                    x += lpBass.lp(x) * bassG
+                    x += (x - lpTreble.lp(x)) * trebG
+
+                    // ۵) بلندی + محدودکنندهٔ نرم
+                    x = tanh(x * outGain)
+                    outPeak = max(outPeak, abs(x))
+                    outBuf[i] = (x * 32767f).toInt().coerceIn(-32768, 32767).toShort()
+                }
+
+                inputLevel = min(1f, inPeak * 2f)
+                outputLevel = min(1f, outPeak)
+                track.write(outBuf, 0, FRAME)
+            }
+        } catch (e: Exception) {
+            lastError = "خطا: ${e.message}"
+        } finally {
+            try { recorder.stop() } catch (_: Exception) { }
+            recorder.release()
+            try { track.stop() } catch (_: Exception) { }
+            track.release()
+            ns?.release(); agc?.release()
+            if (handle != 0L) RNNoise.destroy(handle)
+            aiActive = false
+            running = false
+        }
+    }
+}
